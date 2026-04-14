@@ -17,7 +17,7 @@ except Exception:
     from dronekit import connect, VehicleMode, LocationGlobalRelative
 
 import os
-os.environ["OPENROUTER_API_KEY"] = "Insert your-key-here"
+os.environ["OPENROUTER_API_KEY"] = "Insert your key here"
 
 import time
 import math
@@ -32,6 +32,8 @@ from agno.agent import Agent
 from agno.tools import Toolkit
 from agno.db.sqlite import SqliteDb
 from agno.models.openrouter import OpenRouter
+from agno.learn import LearningMachine
+from agno.compression.manager import CompressionManager
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
@@ -644,8 +646,10 @@ def _safety_check(action, altitude=None):
             return False, f"Altitude {altitude}m exceeds 120m limit."
         if action not in ("takeoff", "arm") and altitude < 2:
             return False, f"Altitude {altitude}m below 2m minimum."
-    if action in ("goto", "change_altitude", "circle", "move", "flyover") and not vehicle.armed:
-        return False, "Drone must be armed first."
+    # NOTE: We do NOT check vehicle.armed here. The agent queues commands in
+    # order (arm -> takeoff -> move -> ...) and the executor runs them
+    # sequentially. Checking armed at queue-time blocks valid future commands
+    # because arm hasn't executed yet when the agent calls move_direction.
     return True, "ok"
 
 # ---------------------------------------------------------------
@@ -732,9 +736,6 @@ class DroneToolkit(Toolkit):
                 self.watch_condition,
                 self.clear_conditions,
                 self.list_conditions,
-                self.get_status,
-                self.get_battery,
-                self.get_position,
                 self.get_flight_summary,
             ]
         )
@@ -1024,26 +1025,32 @@ ACTIVE_MODEL = OpenRouter(
 )
 _all_agents: list = []
 
+
 def _build_system_message():
     loc_list = "\n".join(
         f"  {name}: {data['description']} (lat={data['lat']}, lon={data['lon']})"
         for name, data in PRESET_LOCATIONS.items()
     )
-    return f"""You control a real drone in a SITL simulation.
+    return f"""/nothink
+You control a real drone in a SITL simulation.
 
 CRITICAL RULES:
 1. When given ANY number of commands in one message, call EVERY required tool in order before responding. Never stop after one tool. Never ask the user for the next step. Just keep calling tools until all steps are done.
-2. Each tool call queues a command for the drone. The drone executes them in order. Your job is to queue ALL of them in one turn.
-3. After ALL tools are called, respond with one short sentence confirming everything was queued.
+2. Each tool call queues a command for the drone. The drone executes them in the background automatically. Your job is to queue ALL of them, then stop.
+3. After ALL tools are called, respond with ONE short sentence only. No explanations, no lists, no bullet points.
 4. NEVER say you cannot do something. NEVER ask to give commands one at a time.
-5. Battery readings are FAKE in simulation. Ignore battery completely. Never mention it.
+5. Battery readings are FAKE in simulation. Ignore battery completely. Never mention it. Never warn about it.
+6. Do NOT call update_session_state. Do NOT write long reasoning. Do NOT ask clarifying questions. Just execute.
+7. NEVER call get_status, get_position, or get_battery to monitor progress. The drone executes commands on its own. You queue and stop. DO NOT POLL. DO NOT WAIT. DO NOT MONITOR.
+8. The queue is asynchronous. Once you queue arm+takeoff+move+RTL, they will all execute in order automatically. You do not need to check if each one finished. Just queue all steps and respond.
 
 MULTI-STEP EXAMPLES:
-- "arm and take off to 20m then fly north 100m then return home" → call arm_drone(), takeoff(20), move_direction("north", 100), return_to_launch() — all four in one turn
+- "arm and take off to 20m then fly north 100m then return home" → arm_drone(), takeoff(20), move_direction("north", 100), return_to_launch()
 - "fly east 200m then circle then go home" → move_direction("east", 200), fly_circle(30), return_to_launch()
 - "do a flyover of the hospital then return" → fly_over("hospital", 50), return_to_launch()
+- "arm takeoff 15m forward 100m nearest building home" → arm_drone(), takeoff(15), move_direction("forward", 100), goto_waypoint(-35.35734, 149.170626, 15), return_to_launch()
 
-MEMORY: Use update_session_state to store the current mission plan whenever you start a multi-step mission. Store it as {{"mission_steps": [...], "mission_name": "..."}}.  When user says "continue" or "resume", read session_state to recall and re-queue any remaining steps.
+NEAREST BUILDING = residence 1 (lat=-35.35734, lon=149.170626)
 
 NAMED LOCATIONS:
 {loc_list}
@@ -1076,6 +1083,21 @@ clear_conditions() / list_conditions()"""
 
 def _build_flight_agent():
     """Build a fresh flight_agent. Called on init and on every model switch."""
+    # Compression triggers after 20 tool calls — high enough that a full mission
+    # chain never gets cut off, but still trims context on very long operations.
+    compression_mgr = CompressionManager(
+        model=OpenRouter(
+            id="google/gemini-2.0-flash-001",
+            extra_body=_NO_THINK_BODY,
+        ),
+        compress_tool_results_limit=20,
+        compress_tool_call_instructions=(
+            "Summarize this drone tool result in one short line. "
+            "Keep: action name, GPS coordinates, altitude, distance, mode, armed status, errors. "
+            "Remove all boilerplate."
+        ),
+    )
+
     return Agent(
         name="Drone",
         model=ACTIVE_MODEL,
@@ -1083,14 +1105,23 @@ def _build_flight_agent():
         db=agent_db,
         add_history_to_context=True,
         num_history_runs=10,
-        # Allow up to 50 tool calls in a single turn — enables full mission chaining
         tool_call_limit=50,
-        # Gives the agent a built-in update_session_state tool to store/recall
-        # mission plans across turns — enables natural "continue/resume"
-        enable_agentic_state=True,
+        compression_manager=compression_mgr,
+        # Disabled: was causing agent to write multi-paragraph essays to
+        # update_session_state which broke JSON parsing
+        enable_agentic_state=False,
+        learning=LearningMachine(
+            db=agent_db,
+            user_memory=True,
+            session_context=True,
+            decision_log=True,
+        ),
+        add_learnings_to_context=True,
         system_message=_build_system_message(),
         markdown=False,
     )
+
+
 
 def _set_active_model(model_id: str):
     """
@@ -1132,15 +1163,16 @@ flight_agent = _build_flight_agent()
 summary_agent = Agent(
     name="Session Summary Agent",
     model=ACTIVE_MODEL,
-    output_schema=FlightReport,
     db=agent_db,
     add_history_to_context=True,
     num_history_runs=10,
     instructions=[
         "You produce flight session summaries from drone flight logs.",
-        "Write a clear, readable narrative of everything the drone did.",
-        "Include all commands, altitudes, locations visited, incidents, duration.",
-        "Write like a pilot debrief. Plain English, no JSON, no field names.",
+        "Write a clear, readable narrative of everything the drone did in plain English.",
+        "Include all commands in order, altitudes reached, locations visited, any incidents, and total duration.",
+        "Write like a pilot debrief — professional, concise, and easy to read.",
+        "Do NOT output JSON, field names, numbers-only, or any structured format.",
+        "Respond with flowing prose paragraphs only.",
     ],
     markdown=False,
 )
@@ -1176,11 +1208,12 @@ _safety_validator = Agent(
 _summariser = Agent(
     name="Post-Flight Summariser",
     model=ACTIVE_MODEL,
-    output_schema=FlightReport,
     db=agent_db,
     instructions=[
-        "Generate a FlightReport from the session log.",
-        "Fill all fields accurately. Write a clear narrative summary.",
+        "Generate a plain English flight summary from the session log provided.",
+        "Write flowing prose paragraphs like a pilot debrief.",
+        "Include: all commands in order, altitudes, locations, incidents, duration.",
+        "Do NOT output JSON, structured data, or field names. Plain text only.",
     ],
     markdown=False,
 )
@@ -1254,20 +1287,13 @@ def run_mission(mission_description: str):
         f"[{e['time']}] {e['action'].upper()} {e['details']} @ alt={e['alt']}m"
         for e in mission_state["flight_log"]
     ]) or "No commands logged."
-    report_resp = _summariser.run(
+    print("-" * 40)
+    _summariser.print_response(
         f"Session: {SESSION_ID} | Duration: {elapsed}s\n"
         f"Mission: {mission_description}\nLog:\n{log_txt}\n"
-        f"Max alt: {round(mission_state['max_altitude'],1)}m"
+        f"Max alt: {round(mission_state['max_altitude'],1)}m",
+        stream=True,
     )
-    report = report_resp.content
-    print("-" * 40)
-    if isinstance(report, FlightReport):
-        print(f"Commands: {report.total_commands} | "
-              f"Max alt: {report.max_altitude_m}m | "
-              f"Duration: {report.duration_seconds}s")
-        print(report.summary)
-    else:
-        print(str(report))
     print(f"\n{SEP}")
 
 # ---------------------------------------------------------------
@@ -1277,8 +1303,16 @@ def run_mission(mission_description: str):
 # Executor clears stop_flag when it picks up the new command.
 # ---------------------------------------------------------------
 def _run_agent_async(fn, *args, **kwargs):
-    stop_flag.set()
-    _clear_queue()
+    """
+    Run agent call in a background thread so the CLI stays responsive.
+    Only interrupts the drone if commands are already queued/running —
+    so a new command mid-mission cancels it and takes over.
+    On the very first command the queue is empty so we do NOT interrupt,
+    which was the root cause of multi-step missions being killed immediately.
+    """
+    if not command_queue.empty() or stop_flag.is_set():
+        stop_flag.set()
+        _clear_queue()
 
     def _target():
         try:
@@ -1327,6 +1361,29 @@ def _handle_input(user_input: str):
     if any(q in low for q in MODEL_QUESTIONS):
         print(f"Current model: {ACTIVE_MODEL.id} (via OpenRouter)")
         print("Switch with: /model <model_id>")
+        return
+
+    if low in ("/status", "status", "what is the status", "full status"):
+        loc  = vehicle.location.global_relative_frame
+        att  = vehicle.attitude
+        batt = vehicle.battery
+        print(f"Mode: {vehicle.mode.name} | Armed: {vehicle.armed}")
+        print(f"Alt: {round(loc.alt,1)}m | lat: {round(loc.lat,6)} | lon: {round(loc.lon,6)}")
+        print(f"Roll: {round(math.degrees(att.roll),1)} Pitch: {round(math.degrees(att.pitch),1)} Yaw: {round(math.degrees(att.yaw),1)}")
+        print(f"Groundspeed: {round(vehicle.groundspeed,1)} m/s")
+        print(f"Battery: {batt.level}% | {batt.voltage}V")
+        return
+
+    if low in ("/battery", "battery", "battery level", "what is the battery"):
+        b = vehicle.battery
+        print(f"Battery: {b.level}% | {b.voltage}V | {b.current}A")
+        return
+
+    if low in ("/position", "position", "where is the drone", "where are we"):
+        loc = vehicle.location.global_relative_frame
+        ll  = vehicle.location.local_frame
+        print(f"GPS: {round(loc.lat,6)}, {round(loc.lon,6)} @ {round(loc.alt,1)}m")
+        print(f"Local: N={round(ll.north,2)}m E={round(ll.east,2)}m D={round(ll.down,2)}m")
         return
 
     if low == "/state":
@@ -1408,7 +1465,8 @@ print("  >> go north 500m, circle with 50m radius, return home")
 print("  >> if altitude exceeds 80 meters RTL")
 print("  >> keep going north / stop / continue")
 print("  >> switch to auto mode / return home / land")
-print("  >> what is the status / where are we")
+print("  what is the status / where are we")
+print("  (or use /status /battery /position for instant readout without AI)")
 print("-" * 60)
 print("  Slash commands:")
 print("  /mission <desc>   4-step plan+safety+execute+report")
